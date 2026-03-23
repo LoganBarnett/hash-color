@@ -1,0 +1,323 @@
+#+title:     hash-color
+#+language:  en
+
+* Introduction
+
+Terminal output is hard to scan when every line looks the same.
+~hash-color~ solves that by assigning each distinct input a
+*stable, deterministic color*: the same string always maps to the
+same ANSI escape sequence, across runs, machines, and shell sessions.
+There are no color assignments to manage — the color is derived from a
+hash of the text itself.
+
+Common use cases:
+
+- Hostnames in multi-host log tails (~web-01~ is always blue,
+  ~web-02~ is always orange).
+- Usernames in audit logs.
+- Service names in structured output piped through ~jq~.
+- Short identifiers (git refs, job IDs) that need to be
+  distinguished at a glance.
+
+The project ships as both a *CLI binary* (~hash-color~) and a *Rust
+library* (~hash-color-lib~) for embedding the same logic in other
+programs.
+
+* Installation
+
+** From source (requires Nix)
+
+#+begin_src sh :exports code
+git clone https://github.com/loganmhb/hash-color
+cd hash-color
+nix develop --command cargo install --path crates/cli
+#+end_src
+
+The binary will be placed in ~$HOME/.cargo/bin/hash-color~.
+
+** Without Nix
+
+Any recent stable Rust toolchain works:
+
+#+begin_src sh :exports code
+cargo install --path crates/cli
+#+end_src
+
+** As a library
+
+Add to your ~Cargo.toml~:
+
+#+begin_src toml :exports code
+[dependencies]
+hash-color-lib = "0.1"
+#+end_src
+
+* CLI Usage
+
+** Basic — colorize a single value
+
+#+begin_src sh :exports code
+# Pipe a string through stdin
+echo "web-01" | hash-color
+
+# Or pass the value directly (avoids a subshell)
+hash-color --value web-01
+#+end_src
+
+Both produce ~web-01~ printed in a consistent color.
+
+** Colorize each line of a file independently
+
+#+begin_src sh :exports code
+kubectl get pods | hash-color --lines
+#+end_src
+
+Without ~--lines~, the entire stdin block is treated as one input and
+gets a single color.  With ~--lines~, each line is hashed separately.
+
+** Background coloring
+
+#+begin_src sh :exports code
+echo "ERROR" | hash-color --ground bg
+# or
+echo "ERROR" | hash-color -g bg
+#+end_src
+
+** Override color-support detection
+
+~hash-color~ detects terminal capabilities automatically (~NO_COLOR~,
+~FORCE_COLOR~, ~COLORTERM~, terminfo, ~TERM~, isatty).  Override when
+needed:
+
+#+begin_src sh :exports code
+hash-color --color-support truecolor   # force 24-bit
+hash-color --color-support 256        # force 256-color
+hash-color --color-support 16         # force 16-color ANSI
+hash-color --color-support none       # strip all color
+#+end_src
+
+** Resolve color collisions with a seed
+
+If two inputs happen to land on the same color, increment the seed
+to shift the mapping:
+
+#+begin_src sh :exports code
+hash-color --seed 1 --value web-01
+hash-color --seed 1 --value web-02   # now definitely different
+#+end_src
+
+** Adjust saturation and lightness (truecolor only)
+
+#+begin_src sh :exports code
+hash-color --saturation 0.9 --value vivid     # more vivid
+hash-color --saturation 0.2 --value muted     # more muted
+hash-color --lightness 0.5 --value midtone
+#+end_src
+
+Defaults: saturation ~0.7~, lightness ~0.60~ foreground / ~0.35~
+background.
+
+** Exclude hue ranges
+
+Exclude specific arcs of the color wheel (degrees, 0–360):
+
+#+begin_src sh :exports code
+# Avoid yellows and greens (60°–180°)
+hash-color --exclude-hue 60:180 --value foo
+
+# Multiple ranges
+hash-color --exclude-hue 60:180 --exclude-hue 240:300 --value foo
+#+end_src
+
+** Color-blindness presets
+
+Shorthand for well-known exclusion ranges:
+
+#+begin_src sh :exports code
+hash-color --color-blind deuteranopia   # exclude greens (80°–170°)
+hash-color --color-blind protanopia    # exclude reds (340°–30°, wraps)
+hash-color --color-blind tritanopia   # exclude blues (180°–270°)
+hash-color --color-blind achromatopsia # grayscale only
+#+end_src
+
+** Whitespace sensitivity
+
+By default, ~"foo"~ and ~"foo\n"~ hash to *different* colors — the
+trailing newline is significant.  This makes it possible to detect
+that two strings differ even when the difference is only whitespace.
+
+Use ~--trim~ to strip trailing ~\r\n~ before hashing, so
+~echo foo | hash-color~ and ~printf foo | hash-color~ agree:
+
+#+begin_src sh :exports code
+echo "foo" | hash-color --trim   # same color as printf "foo" | hash-color --trim
+#+end_src
+
+** Environment variables
+
+Every flag has an environment variable counterpart:
+
+| Flag                | Environment variable       |
+|---------------------+----------------------------|
+| ~--ground~          | ~HASH_COLOR_GROUND~        |
+| ~--color-support~   | ~HASH_COLOR_SUPPORT~       |
+| ~--seed~            | ~HASH_COLOR_SEED~          |
+| ~--saturation~      | ~HASH_COLOR_SATURATION~    |
+| ~--lightness~       | ~HASH_COLOR_LIGHTNESS~     |
+| ~--exclude-hue~     | ~HASH_COLOR_EXCLUDE_HUE~   |
+| ~--color-blind~     | ~HASH_COLOR_COLOR_BLIND~   |
+| ~--value~           | ~HASH_COLOR_VALUE~         |
+| ~--trim~            | ~HASH_COLOR_TRIM~          |
+| ~--log-level~       | ~LOG_LEVEL~                |
+| ~--log-format~      | ~LOG_FORMAT~               |
+
+* Library Usage
+
+Add ~hash-color-lib~ to your ~[dependencies]~ and use
+~HashColorizer~ directly:
+
+#+begin_src rust :exports code
+use hash_color_lib::{
+    ColorBlindnessMode, ColorSupport, ColorizerOptions,
+    Ground, HashColorizer, HueExclusion,
+};
+
+fn main() {
+    // Auto-detect color support from the environment.
+    let colorizer = HashColorizer::new(ColorizerOptions::default());
+
+    // colorize() hashes the text and wraps it in ANSI escapes.
+    // Printing a ColorizedText emits: <open><text><reset>.
+    println!("{}", colorizer.colorize("web-01"));
+    println!("{}", colorizer.colorize("web-02")); // different color
+}
+#+end_src
+
+** Forcing a color level
+
+#+begin_src rust :exports code
+let colorizer = HashColorizer::new(ColorizerOptions {
+    color_support: Some(ColorSupport::TrueColor),
+    ..Default::default()
+});
+#+end_src
+
+** Background coloring
+
+#+begin_src rust :exports code
+use hash_color_lib::Ground;
+
+let colorizer = HashColorizer::new(ColorizerOptions {
+    ground: Ground::Background,
+    ..Default::default()
+});
+#+end_src
+
+** Separating hash key from display text
+
+When a label appears embedded in a longer line, hash only the label
+so its color is stable regardless of the surrounding context:
+
+#+begin_src rust :exports code
+let line = "[2024-01-01] web-01: request received";
+let colored = colorizer.colorize_with_key(b"web-01", line);
+println!("{colored}"); // whole line colored by web-01's hash
+#+end_src
+
+** Color-blindness preset
+
+#+begin_src rust :exports code
+let colorizer = HashColorizer::new(ColorizerOptions {
+    color_support: Some(ColorSupport::TrueColor),
+    hue_exclusions: ColorBlindnessMode::Deuteranopia.hue_exclusions(),
+    ..Default::default()
+});
+#+end_src
+
+** Custom hue exclusion
+
+#+begin_src rust :exports code
+let colorizer = HashColorizer::new(ColorizerOptions {
+    color_support: Some(ColorSupport::TrueColor),
+    hue_exclusions: vec![
+        HueExclusion::new(60.0, 180.0),  // no yellows or greens
+    ],
+    ..Default::default()
+});
+#+end_src
+
+** Resolving collisions with a seed
+
+#+begin_src rust :exports code
+// Increment seed until "foo" and "bar" land on different colors.
+let colorizer = HashColorizer::new(ColorizerOptions {
+    seed: 1,
+    ..Default::default()
+});
+#+end_src
+
+* Gotchas and Tradeoffs
+
+** Whitespace is significant by default
+
+~"foo"~ and ~"foo\n"~ produce different colors.  This is intentional
+— it lets you detect whitespace differences — but it means
+~echo foo | hash-color~ and ~printf foo | hash-color~ will disagree
+unless you pass ~--trim~.
+
+** Collisions are possible
+
+The hash maps to a finite number of colors (approximately 852
+distinct RGB triples at default saturation/lightness in truecolor
+mode, and only 14 usable slots in 16-color mode).  Two different
+inputs may land on the same color by chance.  Use ~--seed~ to shift
+the mapping when a collision matters.
+
+** Color detection is heuristic
+
+Detection reads ~NO_COLOR~, ~FORCE_COLOR~, ~COLORTERM~, terminfo
+(~Tc~ / ~setrgbf~), and ~TERM~, then falls back to isatty.  Piped
+output is always plain text unless ~FORCE_COLOR~ is set or
+~--color-support~ overrides detection.
+
+Terminal-specific checks (such as ~TERM_PROGRAM~) are intentionally
+absent.  If your terminal does not set ~COLORTERM=truecolor~ and does
+not advertise the ~Tc~ or ~setrgbf~ terminfo capability, set it
+yourself in your shell profile:
+
+#+begin_src sh :exports code
+export COLORTERM=truecolor
+#+end_src
+
+Both mechanisms are widely supported by modern terminals and shells.
+Per-terminal allowlists are a maintenance burden and will not be added.
+
+Note that some other color-aware tools (Node's ~supports-color~, for
+example) do check ~TERM_PROGRAM~ and will therefore detect truecolor
+in environments where ~hash-color~ does not.  If you notice the
+discrepancy, the fix is the same: set ~COLORTERM=truecolor~ in your
+shell profile, which will satisfy both.
+
+** 16-color output has limited hue fidelity
+
+In 16-color mode, hue exclusions work by filtering the fixed ANSI
+palette entries.  The effective granularity is coarse — a broad
+exclusion may eliminate most of the palette and leave only a few
+choices (or just the achromatic white/grey entries).
+
+** The hash function is not cryptographic
+
+FNV-1a with a SplitMix64 finalizer is fast and deterministic but
+not collision-resistant in a security sense.  Do not use hash-color
+output as a security boundary.
+
+* Contributing
+
+Contributions are welcome.  Before sending a patch:
+
+1. Run the full test suite: ~nix develop --command cargo test --workspace~
+2. Ensure the code is formatted: ~nix develop --command cargo fmt~
+3. Follow the coding conventions described in ~CLAUDE.md~.
+
+See [[file:CONTRIBUTING.org][CONTRIBUTING.org]] for the full contributor guide (once it exists;
+for now, open an issue or pull request on GitHub).
